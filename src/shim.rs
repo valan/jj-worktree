@@ -247,13 +247,14 @@ pub fn run(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
             // semantics; `list` gains no jj-specific value here because a
             // colocated workspace *is* a real git worktree, and the plain
             // `jj-worktree list` formatting is not porcelain and rejects git's
-            // own options. Anything else -- `prune`, `move`, `repair`, an
-            // unknown flag such as `--detach` -- falls through to real git.
+            // own options. Anything else -- `prune`, `move`, `repair`, a
+            // detached request (`--detach` or its short form `-d`), `--orphan`
+            // -- falls through to real git.
             let worktree_args: Vec<String> = args[subcmd_index + 1..].to_vec();
             let sub = worktree_args.first().map(String::as_str);
             let has = |flag: &str| worktree_args.iter().any(|a| a == flag);
             let translate = match sub {
-                Some("add") => !has("--detach") && !has("--orphan"),
+                Some("add") => !has("--detach") && !has("--orphan") && !has("-d"),
                 Some("remove") => true,
                 Some("list") => worktree_args.iter().skip(1).all(|a| !a.starts_with('-')),
                 _ => false,

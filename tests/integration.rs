@@ -838,6 +838,53 @@ fn shim_worktree_add_orphan_passthrough() {
     );
 }
 
+/// Git also accepts `-d` as the short form of `--detach`. The short form must
+/// be excluded from translation just like the long form, or `parse_add_args`
+/// would treat it as an unknown no-op and create a jj workspace where the
+/// caller asked for a detached git worktree.
+#[test]
+fn shim_worktree_add_detach_short_passthrough() {
+    require_jj_and_git();
+
+    let (_tmp, root) = setup_colocated_jj_repo();
+    // A freshly initialized colocated repo has an unborn git HEAD; real git
+    // needs a commit to detach at.
+    let initial = Command::new("jj")
+        .args(["new"])
+        .current_dir(&root)
+        .output()
+        .unwrap();
+    assert!(
+        initial.status.success(),
+        "jj new failed: {}",
+        String::from_utf8_lossy(&initial.stderr)
+    );
+    let shim_dir = TempDir::new().unwrap();
+    let shim_path = shim_dir.path().canonicalize().unwrap();
+
+    run_git_shim(&root, &["worktree", "add", "-d", "detached-ws"], &shim_path).success();
+
+    // Real git made a git worktree, not a jj workspace.
+    let ws_dir = root.join("detached-ws");
+    assert!(ws_dir.exists(), "git worktree directory should exist");
+    assert!(
+        ws_dir.join(".git").is_file(),
+        "detached worktree should be a real git worktree (.git file), not a jj workspace"
+    );
+
+    let output = Command::new("jj")
+        .args(["workspace", "list"])
+        .current_dir(&root)
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        !stdout.contains("detached-ws"),
+        "jj must not track the detached git worktree as a workspace, got: {}",
+        stdout
+    );
+}
+
 // ---------------------------------------------------------------------------
 // 10. add: leading directories like real git
 // ---------------------------------------------------------------------------
