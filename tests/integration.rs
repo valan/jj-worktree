@@ -885,6 +885,75 @@ fn shim_worktree_add_detach_short_passthrough() {
     );
 }
 
+/// `remove` must translate only registered jj workspaces. A git-native
+/// worktree (created via the `add --orphan` passthrough) is unknown to jj;
+/// translating its removal fails with "no workspace found for path" and
+/// leaves the worktree behind, so it must reach real git instead.
+#[test]
+fn shim_worktree_remove_git_native_passthrough() {
+    require_jj_and_git();
+
+    let (_tmp, root) = setup_colocated_jj_repo();
+    let shim_dir = TempDir::new().unwrap();
+    let shim_path = shim_dir.path().canonicalize().unwrap();
+
+    run_git_shim(
+        &root,
+        &[
+            "worktree",
+            "add",
+            "--orphan",
+            "-b",
+            "orphan-branch",
+            "orphan-ws",
+        ],
+        &shim_path,
+    )
+    .success();
+
+    run_git_shim(
+        &root,
+        &["worktree", "remove", "--force", "orphan-ws"],
+        &shim_path,
+    )
+    .success();
+
+    assert!(
+        !root.join("orphan-ws").exists(),
+        "git-native worktree should be removed by real git"
+    );
+}
+
+/// `-f` is git's short form of `--force`; a translated `remove -f` must not
+/// fail with "unknown option" where real git would succeed.
+#[test]
+fn shim_worktree_remove_short_force_translates() {
+    require_jj_and_git();
+
+    let (_tmp, repo_root, _main_ws) = setup_jj_repo();
+    let shim_dir = TempDir::new().unwrap();
+    let shim_path = shim_dir.path().canonicalize().unwrap();
+
+    run_jj_worktree(&repo_root, &["add", "forced-ws"]).success();
+
+    run_git_shim(
+        &repo_root,
+        &["worktree", "remove", "-f", "forced-ws"],
+        &shim_path,
+    )
+    .success()
+    .stderr(predicate::str::contains("Removed workspace 'forced-ws'"));
+
+    assert!(
+        !repo_root.join("forced-ws").exists(),
+        "translated removal should delete the workspace directory"
+    );
+    assert!(
+        !repo_root.join(".jj-worktree-meta/forced-ws.json").exists(),
+        "translated removal should delete the metadata file"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // 10. add: leading directories like real git
 // ---------------------------------------------------------------------------

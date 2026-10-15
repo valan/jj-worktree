@@ -352,14 +352,14 @@ fn get_workspace_path(
     Ok(candidate.to_string_lossy().to_string())
 }
 
-/// `jj-worktree remove [--force] <path>`
+/// `jj-worktree remove [-f | --force] <path>`
 fn cmd_remove(cwd: &Path, args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let mut force = false;
     let mut path: Option<String> = None;
 
     for arg in args {
         match arg.as_str() {
-            "--force" => force = true,
+            "--force" | "-f" => force = true,
             a if a.starts_with('-') => {
                 return Err(format!("unknown option: {a}").into());
             }
@@ -526,6 +526,53 @@ pub fn reap_forgotten_workspaces(cwd: &Path) {
         let _ = meta::remove(&repo_root, &ws_name);
         eprintln!("Forgotten workspace '{ws_name}' at {}", recorded.display());
     }
+}
+
+/// Whether a shim-mode `git worktree remove <args>` targets a workspace
+/// registered with jj.
+///
+/// Git-native worktrees (created via the `add --detach` / `-d` / `--orphan`
+/// passthrough) are unknown to jj; translating their removal would fail with
+/// "no workspace found for path" and leave the worktree behind. Such targets
+/// belong to real git, which applies its own safety checks (uncommitted
+/// changes, locked worktrees, main-worktree protection). Direct-mode
+/// `jj-worktree remove` is unaffected: it always runs jj semantics and errors
+/// on unregistered paths.
+pub fn remove_targets_registered_workspace(cwd: &Path, args: &[String]) -> bool {
+    // args[0] is the "remove" head; the target is the first positional, and
+    // flags (`--force` / `-f`) do not affect it.
+    let rest = if args.first().map(String::as_str) == Some("remove") {
+        &args[1..]
+    } else {
+        args
+    };
+    let mut path: Option<&String> = None;
+    for arg in rest {
+        if arg.starts_with('-') {
+            continue;
+        }
+        if path.is_none() {
+            path = Some(arg);
+        }
+    }
+    let Some(path_str) = path else {
+        return false;
+    };
+    let Some(repo_root) = jj::find_repo_root(cwd) else {
+        return false;
+    };
+    let Ok(target_path) = resolve_path(cwd, path_str) else {
+        return false;
+    };
+    // Mirror cmd_remove's containment check so a path outside the repository
+    // is never translated on the strength of the basename fallback alone.
+    let canonical_repo_root = repo_root
+        .canonicalize()
+        .unwrap_or_else(|_| repo_root.clone());
+    if !target_path.starts_with(&canonical_repo_root) {
+        return false;
+    }
+    find_workspace_name(&repo_root, &target_path).is_ok()
 }
 
 /// Find workspace name by matching the canonical path against known workspaces.

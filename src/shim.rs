@@ -255,7 +255,14 @@ pub fn run(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
             let has = |flag: &str| worktree_args.iter().any(|a| a == flag);
             let translate = match sub {
                 Some("add") => !has("--detach") && !has("--orphan") && !has("-d"),
-                Some("remove") => true,
+                Some("remove") => {
+                    // Translate only when the target is a workspace registered
+                    // with jj; git-native worktrees (e.g. created via the
+                    // `add --detach`/`-d`/`--orphan` passthrough) are unknown
+                    // to jj and belong to real git, which applies its own
+                    // safety checks.
+                    crate::worktree::remove_targets_registered_workspace(&start_dir, &worktree_args)
+                }
                 Some("list") => worktree_args.iter().skip(1).all(|a| !a.starts_with('-')),
                 _ => false,
             };
