@@ -168,6 +168,19 @@ fn cmd_add(cwd: &Path, args: &[String]) -> Result<(), Box<dyn std::error::Error>
         .ok_or("invalid path: cannot determine workspace name")?
         .to_string();
 
+    // Match real git, which creates any missing leading directories for the
+    // worktree path. `jj workspace add` requires the destination's parent to
+    // exist, so a caller that passes e.g. `.kilo/worktrees/<name>` fails when
+    // `.kilo/worktrees` is absent. (An existing, empty destination is fine.)
+    let dest = if ws_path.is_absolute() {
+        ws_path.to_path_buf()
+    } else {
+        cwd.join(ws_path)
+    };
+    if let Some(parent) = dest.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+
     // 1. jj workspace add <path>
     jj::run_stdout(Some(&repo_root), &["workspace", "add", &parsed.path])?;
 

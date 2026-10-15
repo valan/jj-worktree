@@ -831,6 +831,42 @@ fn shim_worktree_add_orphan_passthrough() {
 }
 
 // ---------------------------------------------------------------------------
+// 10. add: leading directories like real git
+// ---------------------------------------------------------------------------
+
+/// Real git creates missing leading directories for the worktree path; the
+/// translated `jj workspace add` refuses when the parent is absent, so a
+/// caller passing a nested path such as `.kilo/worktrees/<name>` (Kilo Code /
+/// Agent Manager does) failed unless it pre-created the parents.
+#[test]
+fn add_creates_leading_directories() {
+    require_jj_and_git();
+
+    let (_tmp, repo_root, _main_ws) = setup_jj_repo();
+    let shim_dir = TempDir::new().unwrap();
+    let shim_path = shim_dir.path().canonicalize().unwrap();
+
+    run_git_shim(
+        &repo_root,
+        &[
+            "worktree",
+            "add",
+            ".kilo/worktrees/nested-ws",
+            "-b",
+            "nested-ws",
+        ],
+        &shim_path,
+    )
+    .success()
+    .stderr(predicate::str::contains("Created workspace 'nested-ws'"));
+
+    assert!(
+        repo_root.join(".kilo/worktrees/nested-ws").exists(),
+        "nested workspace directory should be created"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // jj as caller: its internal git worktree calls pass through (recursion guard)
 // ---------------------------------------------------------------------------
 
