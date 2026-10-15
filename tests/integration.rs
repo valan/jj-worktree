@@ -1138,3 +1138,52 @@ fn jj_internal_prune_stays_pure_passthrough() {
         stdout
     );
 }
+
+/// The caller-identity check must not depend on the verbose-logging option:
+/// with `JJ_WORKTREE_ISSUE_INCLUDE_CMDLINE=1` the JSONL log records the
+/// parent's full argv (`jj workspace add inner`), but identity comparison
+/// against `"jj"` must still succeed, or jj's internal `remove`/`prune`
+/// would be translated (and its prune would reap).
+#[test]
+fn jj_internal_calls_pass_through_with_verbose_issue_log() {
+    require_jj_and_git();
+
+    let (_tmp, root) = setup_colocated_jj_repo();
+    let shim_dir = TempDir::new().unwrap();
+    let shim_path = shim_dir.path().canonicalize().unwrap();
+
+    let env = [("JJ_WORKTREE_ISSUE_INCLUDE_CMDLINE", "1")];
+
+    let added = run_jj_with_shim_on_path(&root, &["workspace", "add", "inner"], &shim_path, &env);
+    assert!(
+        added.status.success(),
+        "jj workspace add must not recurse with verbose issue logging, stdout: {}, stderr: {}",
+        String::from_utf8_lossy(&added.stdout),
+        String::from_utf8_lossy(&added.stderr)
+    );
+
+    let forgotten =
+        run_jj_with_shim_on_path(&root, &["workspace", "forget", "inner"], &shim_path, &env);
+    assert!(
+        forgotten.status.success(),
+        "jj workspace forget must pass through with verbose issue logging, stderr: {}",
+        String::from_utf8_lossy(&forgotten.stderr)
+    );
+
+    let list = Command::new("jj")
+        .args(["workspace", "list"])
+        .current_dir(&root)
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&list.stdout);
+    assert!(
+        !stdout.contains("inner"),
+        "inner workspace should be forgotten, got: {}",
+        stdout
+    );
+    assert!(
+        stdout.contains("default"),
+        "default workspace must survive, got: {}",
+        stdout
+    );
+}
