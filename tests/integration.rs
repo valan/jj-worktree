@@ -745,7 +745,11 @@ fn shim_status_maps_added_to_staged_add() {
 /// correct where the shim's translation would be a lossy no-op or an error.
 ///
 /// Regression: `list --porcelain` (used by git clients to enumerate
-/// worktrees) used to fail with "list takes no options".
+/// worktrees) used to fail with "list takes no options". The passthrough must
+/// also be complete: `jj workspace add` registers a git worktree even in the
+/// bare-backed non-colocated layout (jj ≥0.46 creates the worktree admin
+/// record for every workspace), so the porcelain output has to name the
+/// added workspace, not just the repository's own line.
 #[test]
 fn shim_worktree_list_porcelain_passthrough() {
     require_jj_and_git();
@@ -754,9 +758,13 @@ fn shim_worktree_list_porcelain_passthrough() {
     let shim_dir = TempDir::new().unwrap();
     let shim_path = shim_dir.path().canonicalize().unwrap();
 
+    run_jj_worktree(&repo_root, &["add", "porcelain-ws"]).success();
+
     run_git_shim(&repo_root, &["worktree", "list", "--porcelain"], &shim_path)
         .success()
-        .stdout(predicate::str::contains("worktree "));
+        .stdout(
+            predicate::str::contains("worktree ").and(predicate::str::contains("porcelain-ws")),
+        );
 }
 
 /// Regression: unhandled worktree subcommands used to die with
@@ -1010,10 +1018,6 @@ fn prune_spares_live_and_protected_workspaces() {
 /// of git on PATH those internal calls land on the shim; translating them
 /// re-enters `jj workspace add` and recurses until the operation fails. The
 /// shim detects that the parent process is `jj` and passes through.
-///
-/// Uses a colocated repo (bare + non-colocated repos never make jj spawn
-/// `git worktree`), exercising the caller-is-jj guard through a real jj
-/// child process.
 fn setup_colocated_jj_repo() -> (TempDir, PathBuf) {
     let tmp = TempDir::new().expect("failed to create temp dir");
     let root = tmp.path().canonicalize().expect("canonicalize tmp");
@@ -1032,13 +1036,32 @@ fn setup_colocated_jj_repo() -> (TempDir, PathBuf) {
     (tmp, root)
 }
 
-fn run_jj_with_shim_on_path(root: &Path, args: &[&str], shim_path: &Path) -> std::process::Output {
+/// Run `jj` with the shim ahead of git on PATH, as a real child process so
+/// the shim's caller-identity check sees `jj` as its parent.
+///
+/// Installs the `git -> jj-worktree` symlink in `shim_path` first (like
+/// `run_git_shim` does): with an empty directory, jj would find real git
+/// later on PATH and the caller-identity guard would never be exercised.
+/// `env_overrides` sets additional environment variables for the jj child.
+fn run_jj_with_shim_on_path(
+    root: &Path,
+    args: &[&str],
+    shim_path: &Path,
+    env_overrides: &[(&str, &str)],
+) -> std::process::Output {
+    let git_link = shim_path.join("git");
+    if !git_link.exists() {
+        std::os::unix::fs::symlink(jj_worktree_bin(), &git_link)
+            .expect("failed to create git symlink");
+    }
+
     let original_path = std::env::var("PATH").unwrap_or_default();
     let shim_first = format!("{}:{}", shim_path.display(), original_path);
     Command::new("jj")
         .args(args)
         .current_dir(root)
         .env("PATH", &shim_first)
+        .envs(env_overrides.iter().copied())
         .output()
         .expect("run jj with shim on PATH")
 }
@@ -1051,7 +1074,7 @@ fn jj_internal_git_worktree_calls_do_not_recurse() {
     let shim_dir = TempDir::new().unwrap();
     let shim_path = shim_dir.path().canonicalize().unwrap();
 
-    let output = run_jj_with_shim_on_path(&root, &["workspace", "add", "inner"], &shim_path);
+    let output = run_jj_with_shim_on_path(&root, &["workspace", "add", "inner"], &shim_path, &[]);
     assert!(
         output.status.success(),
         "jj workspace add must not recurse through the shim, stdout: {}, stderr: {}",
@@ -1087,10 +1110,11 @@ fn jj_internal_prune_stays_pure_passthrough() {
     let shim_dir = TempDir::new().unwrap();
     let shim_path = shim_dir.path().canonicalize().unwrap();
 
-    let added = run_jj_with_shim_on_path(&root, &["workspace", "add", "inner"], &shim_path);
+    let added = run_jj_with_shim_on_path(&root, &["workspace", "add", "inner"], &shim_path, &[]);
     assert!(added.status.success());
 
-    let forgotten = run_jj_with_shim_on_path(&root, &["workspace", "forget", "inner"], &shim_path);
+    let forgotten =
+        run_jj_with_shim_on_path(&root, &["workspace", "forget", "inner"], &shim_path, &[]);
     assert!(
         forgotten.status.success(),
         "jj workspace forget must work with the shim on PATH, stderr: {}",
