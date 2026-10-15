@@ -32,15 +32,21 @@ README の前提は「shim は `jj-worktree run` 経由で呼び出し側ツー�
 **shim の契約を「drop-in な `git`」と明文化し、完全に再現できる操作だけ翻訳する。**
 翻訳できないものはすべて real git に渡す:
 
-1. **翻訳対象**: `--detach` / `--orphan` を含まない `add`、`remove`、オプションなし
-   `list` (従来どおり)。
+1. **翻訳対象**: `--detach` / `-d` / `--orphan` を含まない `add`、jj 登録済み
+   workspace への `remove`、オプションなし `list` (従来どおり)。
 2. **pass-through 対象**: `prune`、`move`、`repair`、`lock`、
-   `list --porcelain` 等のオプション付き形式、`add --detach` / `--orphan`。
+   `list --porcelain` 等のオプション付き形式、`add --detach` / `-d` / `--orphan`、
+   git 由来 worktree (pass-through で作成されたもの) への `remove`。
    colocated workspace は本物の git worktree なので real git の応答が常に正で、
    no-op による意図の損失も "unknown subcommand" による死亡も起きない。
-3. **jj 由来呼び出しのガード** (`issue_log::caller_is_jj`): 親プロセスが `jj`
+   git 由来 worktree の remove を翻訳すると "no workspace found for path" で
+   失敗して worktree が残留するため、real git 自身の安全機構
+   (未コミット変更、locked、メインワークスペース保護) に委ねる。
+3. **jj 由来呼び出しのガード** (`issue_log::caller_is_jj`): 親プロセス名が `jj`
    なら全 `git worktree` 呼び出しを無条件 pass-through する。jj は自ワークスペースの
    バッキング git worktree を管理しており、その内部呼び出しを翻訳すると再帰する。
+   判定はプロセス名ベースで、詳細ログ (`JJ_WORKTREE_ISSUE_INCLUDE_CMDLINE`) の
+   有無に依存しない。
 4. **prune 時の forgotten workspace reap** (`worktree::reap_forgotten_workspaces`):
    呼び出し側起点の `prune` (親 ≠ jj) を real git に渡す前に、
    `jj workspace list` で workspace を列挙し、`jj workspace root --name <ws>` で
@@ -49,6 +55,10 @@ README の前提は「shim は `jj-worktree run` 経由で呼び出し側ツー�
    shim を経由せず作られた workspace も対象になる
    (= 2026-06-18 issue の方向性と整合、廃止を先取りしない)。見つかった古い
    `.jj-worktree-meta/<ws>.json` は best effort で削除する。
+   reap は real git 自身の prune 判定と同期する: 呼び出し側オプションを転送した
+   `worktree prune --dry-run` のレポート (stderr に出る) をパースし、
+   real git が保持するレコード (`--expire` 未到達、locked) を持つ workspace は
+   スキップする。`-n` / `--dry-run` 付きの prune は reap 自体を実行しない。
 
 不採用案:
 
@@ -66,11 +76,14 @@ colocated workspace は既に本物の git worktree なので real git の応答
 
 ## トレードオフ
 
-- **reap に猶予期間がない**: real git の prune と同様、ディレクトリを *移動* した
-  だけの workspace も reap 対象になる (jj には lock 概念がなく pin できない)。
-  ドキュメントで明示する。
+- **reap の猶予期間は real git に従う**: 独自の猶予期間は導入せず、
+  `--expire` と lock の判定は real git 自身の `--dry-run` 判定に委譲する。
+  その上で、ディレクトリを *移動* しただけの workspace も real git が
+  prune する条件を満たせば reap 対象になる (jj には lock 概念がなく
+  pin できない)。ドキュメントで明示する。
 - **reap が `jj workspace root` を workspace 数分呼ぶ**: 呼び出し側起点の prune 時
-  のみで、jj 由来の prune では発生しない。
+  のみで、jj 由来の prune では発生しない。加えて prune 1 回につき
+  real git の dry-run を 1 回実行する。
 - **`caller_is_jj` は親プロセス名依存**: DR-0002 と同じ OS 依存の取得方法で、
   取得失敗時は「jj ではない」側に倒す (翻訳される)。jj の内部呼び出しを取りこぼした
   場合は再帰が再発しうるが、これは保守的なフォールバックである。
@@ -80,14 +93,20 @@ colocated workspace は既に本物の git worktree なので real git の応答
 
 ## 実装
 
-- `src/issue_log.rs`: `caller_is_jj()` (DR-0002 の `caller_cmdline` を再利用)
-- `src/shim.rs`: worktree arm の translate 判定 (`add` は `--detach` / `--orphan`
-  で翻訳除外)、jj 由来呼び出しの pass-through、prune 直前の reap 呼び出し
+- `src/issue_log.rs`: `caller_is_jj()` (親プロセス名ベース、
+  `caller_cmdline` / 詳細ログ設定に非依存)
+- `src/shim.rs`: worktree arm の translate 判定 (`add` は `--detach` / `-d` /
+  `--orphan` で翻訳除外、`remove` は jj 登録済み workspace のみ翻訳)、
+  jj 由来呼び出しの pass-through、prune 直前の reap 呼び出し
+  (`-n` / `--dry-run` では実行しない)
 - `src/worktree.rs`: `reap_forgotten_workspaces()` (best effort、保護対象除外)、
+  `git_prune_view()` / `worktree_path_for_record()` (real git の dry-run
+  レポートと管理レコードの照合)、
   `cmd_add` の親ディレクトリ自動作成 (real git と同じ挙動;
   `jj workspace add` は親ディレクトリを要求するため、
   `.kilo/worktrees/<name>` のようなネストしたパスで失敗していた)
-- テスト: `tests/integration.rs` に pass-through / reap / jj ガード 8 件追加
+- テスト: `tests/integration.rs` に pass-through / reap / jj ガード /
+  git 由来 remove / prune 同期 を追加 (統合 41 件)
 
 ## 関連
 

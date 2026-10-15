@@ -197,10 +197,10 @@ PATH 上に同一バイナリを指す `jj-worktree` エントリがあればイ
 
 `git worktree add` のオプションは呼び出し側 (Claude Code 等) のバージョンアップで増える可能性があり、shim を system-wide な `git` として常駐させる呼び出し側もある。`jj-worktree` はこれを層状のポリシーで扱う:
 
-1. **明示的な no-op リスト（翻訳対象呼び出しのみ）**: `--track` / `--no-track` / `--lock` / `--reason <val>` / `--guess-remote` / `--no-guess-remote` は、翻訳される `add` に対して静かに無視する。jj workspace 側に対応概念がないため。`--detach` / `--orphan` は翻訳せず、呼び出し全体を real git に渡す。
+1. **明示的な no-op リスト（翻訳対象呼び出しのみ）**: `--track` / `--no-track` / `--lock` / `--reason <val>` / `--guess-remote` / `--no-guess-remote` は、翻訳される `add` に対して静かに無視する。jj workspace 側に対応概念がないため。`--detach` / `-d` / `--orphan` は翻訳せず、呼び出し全体を real git に渡す。
 2. **未知の `--xxx` / `-x` フラグ**: エラーにせず、警告として `issue_log` に記録 + stderr に `[For AI agents]` 誘導ブロックを出力した上で no-op として受け入れる。値あり/なしの区別がつかないため、`--xxx=val` 形式は1引数で消費、`--xxx` 単独は次の引数を値とは見なさない。
-3. **drop-in 契約 (DR-0004)**: shim が翻訳するのは完全に再現できる worktree 操作（`--detach`/`--orphan` を含まない `add`、`remove`、オプションなし `list`）のみ。それ以外 — `prune`、`move`、`repair`、`lock`、`list --porcelain` 等のオプション付き形式 — はすべてそのまま real git に渡す。親プロセスが `jj` である全 `git worktree` 呼び出しも同様（`caller_is_jj` ガード）。jj は自ワークスペースのバッキング git worktree を管理しており、その呼び出しを翻訳すると再帰する。
-4. **prune 時の reap (DR-0004)**: 呼び出し側起点の `prune` を real git に渡す前に、記録パス（`jj workspace root --name`、meta 非依存）が存在しない workspace を forget し、古いメタデータを削除する。保護対象 workspace は除外し、jj 自身の prune は純粋な pass-through のまま。
+3. **drop-in 契約 (DR-0004)**: shim が翻訳するのは完全に再現できる worktree 操作（`--detach`/`-d`/`--orphan` を含まない `add`、jj 登録済み workspace への `remove`、オプションなし `list`）のみ。それ以外 — `prune`、`move`、`repair`、`lock`、`list --porcelain` 等のオプション付き形式 — はすべてそのまま real git に渡す。親プロセスが `jj` である全 `git worktree` 呼び出しも同様（`caller_is_jj` ガード）。jj は自ワークスペースのバッキング git worktree を管理しており、その呼び出しを翻訳すると再帰する。git 由来の worktree（`--detach` / `-d` / `--orphan` pass-through で作成）への `remove` も real git に渡され、git 自身の安全機構（未コミット変更、locked、メインワークスペース保護）が働く。
+4. **prune 時の reap (DR-0004)**: 呼び出し側起点の `prune` を real git に渡す前に、記録パス（`jj workspace root --name`、meta 非依存）が存在しない workspace を forget し、古いメタデータを削除する。reap は real git 自身の prune 判定と同期する — 呼び出し側オプションを転送した `--dry-run` レポート（stderr に出る）をパースし、real git が保持する workspace はスキップする。`--expire` や locked レコードの判定はここで再実装せず real git に委譲する。`--dry-run` / `-n` は reap 自体に届かず、保護対象 workspace と jj 自身の prune は除外 / 純粋な pass-through のまま。
 
 自己報告ログ (`issues.log`) には種別 (kind) として `unknown_option` / `parse_error` / `unsupported_combination` を記録し、ts / cmd / option / argv / caller_pid / caller_cmdline を含む。AI エージェントが暗黙にフォールバックする前にユーザに気付かせる仕組み。
 
@@ -252,14 +252,14 @@ brew install kawaz/tap/jj-worktree
 
 ## テスト
 
-101 テスト (68 unit + 33 integration)
+110 テスト (69 unit + 41 integration)
 
 ### ユニットテスト
 
 - `jj.rs`: find_repo_root, build_command (4)
 - `meta.rs`: save/load/remove/list/serialization (9)
 - `shim.rs`: parse_git_global_opts (18), parse_branch_delete (6), parse_rev_parse_refs (9)
-- `worktree.rs`: parse_add_args (16)
+- `worktree.rs`: parse_add_args (16), prune_is_dry_run (1)
 - `issue_log.rs`: kind 文字列、log path 上書き、JSONL エントリ、caller_is_jj (4)
 - `main.rs`: invocation_mode, help (2)
 
@@ -275,10 +275,11 @@ brew install kawaz/tap/jj-worktree
 6. list: フォーマット / 空リポジトリ / shim 経由
 7. remove: 安全性チェック / main 保護 / 相対パス / shim 経由
 8. branch -d: 管理対象 → jj bookmark delete / 非管理対象 → real git
-9. drop-in パススルー: `list --porcelain`、未対応サブコマンド、`add --orphan` は real git へ
+9. drop-in パススルー: `list --porcelain`、未対応サブコマンド、`add --orphan` / `add -d` は real git へ
 10. add: real git と同様に親ディレクトリを自動作成
-11. prune 時の reap: 消滅済み workspace（shim 作成・meta なし双方）を forget / 生存・保護対象は残留
-12. jj が呼び出し元: colocated repo で jj の内部 git worktree 呼び出しは pass-through（再帰なし）、jj 自身の prune は純粋 pass-through
+11. prune 時の reap: 消滅済み workspace（shim 作成・meta なし双方）を forget / 生存・保護対象は残留 / `--expire` と locked レコードは real git の判定と同期 / dry-run は jj 状態を変更しない / colocated repo も reap 対象
+12. jj が呼び出し元: colocated repo で jj の内部 git worktree 呼び出しは pass-through（再帰なし、詳細 issue ログ有効時も同様）、jj 自身の prune は純粋 pass-through
+13. remove: jj 登録済み workspace のみ翻訳 / git 由来 worktree（`-d` / `--orphan` 生成）は real git へ（`--force` と `-f` の両方）
 
 ## リポジトリ
 
