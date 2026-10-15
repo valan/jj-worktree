@@ -474,6 +474,60 @@ fn cmd_remove(cwd: &Path, args: &[String]) -> Result<(), Box<dyn std::error::Err
     Ok(())
 }
 
+/// Reap jj workspaces whose working directory no longer exists.
+///
+/// Callers that delete a worktree by renaming its directory aside and running
+/// `git worktree prune` (Kilo Code / Agent Manager does exactly this) only
+/// clean git's own admin records: the colocated jj workspace record then
+/// lingers until a manual `jj workspace forget`. Workspaces created without
+/// this shim (no `.jj-worktree-meta` entry) are covered too, because the
+/// recorded path comes from `jj workspace root --name` itself.
+///
+/// Best effort: failures are reported on stderr and skipped, never
+/// propagated, so the subsequent real-git prune is not disturbed. Only the
+/// protected workspaces are exempt; like real git's prune there is no grace
+/// period, so a workspace whose directory was *moved* elsewhere is reaped as
+/// well (jj has no lock concept to pin it).
+pub fn reap_forgotten_workspaces(cwd: &Path) {
+    let repo_root = match jj::find_repo_root(cwd) {
+        Some(root) => root,
+        None => return,
+    };
+    let ws_list_output = match jj::run_stdout(Some(&repo_root), &["workspace", "list"]) {
+        Ok(output) => output,
+        Err(_) => return,
+    };
+    for ws_name in parse_workspace_names(&ws_list_output) {
+        if PROTECTED_WORKSPACES.contains(&ws_name.as_str()) {
+            continue;
+        }
+        // Ask jj for the recorded path instead of consulting metadata, so
+        // workspaces created outside this shim (no .jj-worktree-meta entry)
+        // are reaped as well.
+        let recorded =
+            match jj::run_stdout(Some(&repo_root), &["workspace", "root", "--name", &ws_name]) {
+                Ok(path) => PathBuf::from(path),
+                Err(e) => {
+                    jj::debug_message(&format!(
+                        "prune reap: cannot resolve path of workspace '{ws_name}': {e}"
+                    ));
+                    continue;
+                }
+            };
+        let recorded = normalize_path(Path::new(&recorded));
+        if recorded.exists() {
+            continue;
+        }
+        if let Err(e) = jj::run_stdout(Some(&repo_root), &["workspace", "forget", &ws_name]) {
+            eprintln!("warning: failed to forget workspace '{ws_name}': {e}");
+            continue;
+        }
+        // Best effort: drop the stale metadata file if one exists.
+        let _ = meta::remove(&repo_root, &ws_name);
+        eprintln!("Forgotten workspace '{ws_name}' at {}", recorded.display());
+    }
+}
+
 /// Find workspace name by matching the canonical path against known workspaces.
 fn find_workspace_name(
     repo_root: &Path,

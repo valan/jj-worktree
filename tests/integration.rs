@@ -867,7 +867,142 @@ fn add_creates_leading_directories() {
 }
 
 // ---------------------------------------------------------------------------
-// jj as caller: its internal git worktree calls pass through (recursion guard)
+// 11. prune reap: forgotten jj workspaces are cleaned up
+// ---------------------------------------------------------------------------
+
+/// Callers that delete a worktree by renaming its directory aside and running
+/// `git worktree prune` (Kilo Code / Agent Manager does exactly this) only
+/// clean git's admin records; in a jj repository the workspace record lingers
+/// until a manual `jj workspace forget`. A caller-initiated prune through the
+/// shim reaps workspaces whose directory is gone.
+#[test]
+fn prune_reaps_forgotten_shim_workspace() {
+    require_jj_and_git();
+
+    let (_tmp, repo_root, _main_ws) = setup_jj_repo();
+    let shim_dir = TempDir::new().unwrap();
+    let shim_path = shim_dir.path().canonicalize().unwrap();
+
+    // Create a workspace through the shim (records .jj-worktree-meta).
+    run_git_shim(&repo_root, &["worktree", "add", "reaped-ws"], &shim_path).success();
+
+    // Delete it the way git clients do: rename aside, then prune.
+    let aside = repo_root.join(".kilo-reaped-tmp");
+    std::fs::rename(repo_root.join("reaped-ws"), &aside).expect("rename ws aside");
+    run_git_shim(
+        &repo_root,
+        &["worktree", "prune", "--expire", "now"],
+        &shim_path,
+    )
+    .success()
+    .stderr(predicate::str::contains("Forgotten workspace 'reaped-ws'"));
+
+    let output = Command::new("jj")
+        .args(["workspace", "list"])
+        .current_dir(&repo_root)
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        !stdout.contains("reaped-ws"),
+        "workspace with deleted directory should be forgotten, got: {}",
+        stdout
+    );
+    assert!(
+        !repo_root.join(".jj-worktree-meta/reaped-ws.json").exists(),
+        "stale metadata file should be removed"
+    );
+
+    std::fs::remove_dir_all(&aside).ok();
+}
+
+/// The reap resolves workspace paths through `jj workspace root --name`
+/// rather than the shim's metadata, so workspaces created without the shim
+/// (e.g. plain `jj workspace add` from another tool) are cleaned up too.
+#[test]
+fn prune_reaps_forgotten_workspace_without_metadata() {
+    require_jj_and_git();
+
+    let (_tmp, repo_root, _main_ws) = setup_jj_repo();
+
+    // Create a workspace with plain jj: no .jj-worktree-meta entry exists.
+    let status = Command::new("jj")
+        .args(["workspace", "add", "plain-ws"])
+        .current_dir(&repo_root)
+        .output()
+        .expect("jj workspace add plain-ws");
+    assert!(status.status.success());
+
+    std::fs::remove_dir_all(repo_root.join("plain-ws")).expect("delete ws dir");
+
+    let shim_dir = TempDir::new().unwrap();
+    let shim_path = shim_dir.path().canonicalize().unwrap();
+    run_git_shim(
+        &repo_root,
+        &["worktree", "prune", "--expire", "now"],
+        &shim_path,
+    )
+    .success()
+    .stderr(predicate::str::contains("Forgotten workspace 'plain-ws'"));
+
+    let output = Command::new("jj")
+        .args(["workspace", "list"])
+        .current_dir(&repo_root)
+        .output()
+        .unwrap();
+    assert!(
+        !String::from_utf8_lossy(&output.stdout).contains("plain-ws"),
+        "meta-less workspace with deleted directory should be forgotten"
+    );
+}
+
+/// The reap is surgical: live workspaces and the protected default workspace
+/// must survive a caller-initiated prune.
+#[test]
+fn prune_spares_live_and_protected_workspaces() {
+    require_jj_and_git();
+
+    let (_tmp, repo_root, _main_ws) = setup_jj_repo();
+    let shim_dir = TempDir::new().unwrap();
+    let shim_path = shim_dir.path().canonicalize().unwrap();
+
+    run_git_shim(&repo_root, &["worktree", "add", "kept-ws"], &shim_path).success();
+
+    run_git_shim(
+        &repo_root,
+        &["worktree", "prune", "--expire", "now"],
+        &shim_path,
+    )
+    .success();
+
+    let output = Command::new("jj")
+        .args(["workspace", "list"])
+        .current_dir(&repo_root)
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("kept-ws"),
+        "live workspace should survive prune, got: {}",
+        stdout
+    );
+    assert!(
+        stdout.contains("default"),
+        "protected default workspace should survive prune, got: {}",
+        stdout
+    );
+    assert!(
+        repo_root.join("kept-ws").exists(),
+        "live workspace directory should survive prune"
+    );
+    assert!(
+        repo_root.join(".jj-worktree-meta/kept-ws.json").exists(),
+        "live workspace metadata should survive prune"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 12. jj as caller: its internal git worktree calls pass through
 // ---------------------------------------------------------------------------
 
 /// In a colocated repository jj itself spawns `git worktree add --orphan ...`

@@ -265,6 +265,17 @@ pub fn run(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
             // as the `git` on PATH -- those internal calls land here. Skipping
             // the translation for jj's own calls avoids re-entering `jj
             // workspace add` and recursing until the operation fails.
+            //
+            // A caller-initiated prune needs one more thing first. Callers
+            // delete a worktree by renaming the directory aside and running
+            // `git worktree prune`, and real git's prune only cleans git's own
+            // admin records -- the colocated jj workspace record would then
+            // linger until a manual `jj workspace forget`. Before handing the
+            // call to real git, forget workspaces whose directories are already
+            // gone; jj's own internal prunes stay pure pass-through.
+            if sub == Some("prune") && !is_jj_caller {
+                crate::worktree::reap_forgotten_workspaces(&start_dir);
+            }
             if !translate || is_jj_caller {
                 return exec_real_git(args);
             }
