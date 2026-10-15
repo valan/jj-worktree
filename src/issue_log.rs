@@ -164,6 +164,21 @@ fn caller_cmdline(ppid: u32) -> String {
     String::new()
 }
 
+/// Whether the immediate parent process is `jj`.
+///
+/// jj (colocated) spawns `git worktree add`/`prune`/... internally to manage
+/// its git worktree. When this shim is ahead of git in PATH, those calls land
+/// on the shim and, if translated, re-enter `jj workspace add`, recursing until
+/// the operation fails. Callers use this to pass jj's own calls through to real
+/// git instead of translating them.
+pub fn caller_is_jj() -> bool {
+    let ppid = parent_pid();
+    if ppid == 0 {
+        return false;
+    }
+    caller_cmdline(ppid) == "jj"
+}
+
 /// Whether the AI-directed stderr block should be emitted.
 ///
 /// Set `JJ_WORKTREE_ISSUE_QUIET=1` to suppress the stderr block (the JSONL log
@@ -245,6 +260,16 @@ mod tests {
             IssueKind::UnsupportedCombination.as_str(),
             "unsupported_combination"
         );
+    }
+
+    #[test]
+    fn caller_is_jj_is_false_when_parent_is_not_jj() {
+        // Under `cargo test` the parent of the test binary is cargo (or
+        // whatever launched it), never `jj`. This only pins the common case;
+        // the jj-parent path is exercised by the integration test
+        // `jj_internal_git_worktree_calls_do_not_recurse`, which spawns a
+        // real jj child process with the shim first on PATH.
+        assert!(!caller_is_jj());
     }
 
     #[test]

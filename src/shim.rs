@@ -240,11 +240,21 @@ pub fn run(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
 
     match (subcmd.as_str(), &repo_root) {
         ("worktree", Some(_root)) => {
+            let worktree_args: Vec<String> = args[subcmd_index + 1..].to_vec();
+            // jj itself (colocated repos) spawns `git worktree` internally to
+            // create/prune/remove the backing git worktree. If this shim is
+            // ahead of real git in PATH -- which it is whenever it is installed
+            // as the `git` on PATH -- those internal calls land here and, if
+            // translated, re-enter `jj workspace add` and recurse until the
+            // operation fails. Pass jj's own calls through to real git
+            // unconditionally.
+            if crate::issue_log::caller_is_jj() {
+                return exec_real_git(args);
+            }
             // Redirect to jj-worktree's worktree module.
             // Pass `start_dir` (which honours `git -C <path>`) so that the
             // worktree subcommands resolve `.jj` relative to that path rather
             // than the process-level current directory.
-            let worktree_args: Vec<String> = args[subcmd_index + 1..].to_vec();
             crate::worktree::run(&start_dir, &worktree_args)
         }
         ("branch", Some(root)) => {

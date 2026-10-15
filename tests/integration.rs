@@ -734,3 +734,117 @@ fn shim_status_maps_added_to_staged_add() {
         stdout
     );
 }
+
+// ---------------------------------------------------------------------------
+// jj as caller: its internal git worktree calls pass through (recursion guard)
+// ---------------------------------------------------------------------------
+
+/// In a colocated repository jj itself spawns `git worktree add --orphan ...`
+/// to create the backing git worktree of a new workspace. With the shim ahead
+/// of git on PATH those internal calls land on the shim; translating them
+/// re-enters `jj workspace add` and recurses until the operation fails. The
+/// shim detects that the parent process is `jj` and passes through.
+///
+/// Uses a colocated repo (bare + non-colocated repos never make jj spawn
+/// `git worktree`), exercising the caller-is-jj guard through a real jj
+/// child process.
+fn setup_colocated_jj_repo() -> (TempDir, PathBuf) {
+    let tmp = TempDir::new().expect("failed to create temp dir");
+    let root = tmp.path().canonicalize().expect("canonicalize tmp");
+
+    let status = Command::new("jj")
+        .args(["git", "init", "--colocate", "."])
+        .current_dir(&root)
+        .output()
+        .expect("jj git init --colocate");
+    assert!(
+        status.status.success(),
+        "jj git init --colocate failed: {}",
+        String::from_utf8_lossy(&status.stderr)
+    );
+
+    (tmp, root)
+}
+
+fn run_jj_with_shim_on_path(root: &Path, args: &[&str], shim_path: &Path) -> std::process::Output {
+    let original_path = std::env::var("PATH").unwrap_or_default();
+    let shim_first = format!("{}:{}", shim_path.display(), original_path);
+    Command::new("jj")
+        .args(args)
+        .current_dir(root)
+        .env("PATH", &shim_first)
+        .output()
+        .expect("run jj with shim on PATH")
+}
+
+#[test]
+fn jj_internal_git_worktree_calls_do_not_recurse() {
+    require_jj_and_git();
+
+    let (_tmp, root) = setup_colocated_jj_repo();
+    let shim_dir = TempDir::new().unwrap();
+    let shim_path = shim_dir.path().canonicalize().unwrap();
+
+    let output = run_jj_with_shim_on_path(&root, &["workspace", "add", "inner"], &shim_path);
+    assert!(
+        output.status.success(),
+        "jj workspace add must not recurse through the shim, stdout: {}, stderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        !String::from_utf8_lossy(&output.stderr).contains("External git program failed"),
+        "jj's internal git call must reach real git, got: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let list = Command::new("jj")
+        .args(["workspace", "list"])
+        .current_dir(&root)
+        .output()
+        .unwrap();
+    assert!(
+        String::from_utf8_lossy(&list.stdout).contains("inner"),
+        "colocated workspace should be created, got: {}",
+        String::from_utf8_lossy(&list.stdout)
+    );
+}
+
+/// The same guard applies to jj's own prunes: a caller-initiated prune gets
+/// the reap, but jj's internal prune (parent is jj) must stay pure
+/// pass-through so it never reaps the workspace it is currently managing.
+#[test]
+fn jj_internal_prune_stays_pure_passthrough() {
+    require_jj_and_git();
+
+    let (_tmp, root) = setup_colocated_jj_repo();
+    let shim_dir = TempDir::new().unwrap();
+    let shim_path = shim_dir.path().canonicalize().unwrap();
+
+    let added = run_jj_with_shim_on_path(&root, &["workspace", "add", "inner"], &shim_path);
+    assert!(added.status.success());
+
+    let forgotten = run_jj_with_shim_on_path(&root, &["workspace", "forget", "inner"], &shim_path);
+    assert!(
+        forgotten.status.success(),
+        "jj workspace forget must work with the shim on PATH, stderr: {}",
+        String::from_utf8_lossy(&forgotten.stderr)
+    );
+
+    let list = Command::new("jj")
+        .args(["workspace", "list"])
+        .current_dir(&root)
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&list.stdout);
+    assert!(
+        !stdout.contains("inner"),
+        "inner workspace should be forgotten, got: {}",
+        stdout
+    );
+    assert!(
+        stdout.contains("default"),
+        "default workspace must survive, got: {}",
+        stdout
+    );
+}
