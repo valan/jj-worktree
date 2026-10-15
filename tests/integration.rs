@@ -1125,6 +1125,160 @@ fn prune_spares_live_and_protected_workspaces() {
     );
 }
 
+/// `git worktree prune -n` / `--dry-run` is a read-only preview: it must not
+/// forget jj workspaces or delete their metadata. (Regression: the reap used
+/// to run before real git saw the options, so a dry-run mutated jj state.)
+#[test]
+fn prune_dry_run_leaves_workspaces_untouched() {
+    require_jj_and_git();
+
+    let (_tmp, repo_root, _main_ws) = setup_jj_repo();
+    let shim_dir = TempDir::new().unwrap();
+    let shim_path = shim_dir.path().canonicalize().unwrap();
+
+    run_jj_worktree(&repo_root, &["add", "dry-ws"]).success();
+    std::fs::rename(repo_root.join("dry-ws"), repo_root.join(".dry-run-aside"))
+        .expect("rename ws aside");
+
+    for dry_flag in ["-n", "--dry-run"] {
+        run_git_shim(&repo_root, &["worktree", "prune", dry_flag], &shim_path).success();
+    }
+
+    let output = Command::new("jj")
+        .args(["workspace", "list"])
+        .current_dir(&repo_root)
+        .output()
+        .unwrap();
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains("dry-ws"),
+        "dry-run must not forget the workspace"
+    );
+    assert!(
+        repo_root.join(".jj-worktree-meta/dry-ws.json").exists(),
+        "dry-run must not delete the metadata file"
+    );
+    assert!(
+        repo_root.join(".git/worktrees").read_dir().unwrap().count() > 0,
+        "dry-run must not remove git's admin records"
+    );
+
+    std::fs::remove_dir_all(repo_root.join(".dry-run-aside")).ok();
+}
+
+/// Real git's `prune --expire <time>` keeps records younger than the expiry.
+/// The reap must keep the jj workspace record for them too, so both sides
+/// agree; the workspace is only reaped once the expiry is reached.
+#[test]
+fn prune_respects_expire() {
+    require_jj_and_git();
+
+    let (_tmp, root) = setup_colocated_jj_repo();
+    let shim_dir = TempDir::new().unwrap();
+    let shim_path = shim_dir.path().canonicalize().unwrap();
+
+    run_git_shim(&root, &["worktree", "add", "expired-ws"], &shim_path).success();
+    std::fs::remove_dir_all(root.join("expired-ws")).expect("delete ws dir");
+
+    // Young record: real git keeps it even with the dir gone.
+    run_git_shim(
+        &root,
+        &["worktree", "prune", "--expire", "1.year.ago"],
+        &shim_path,
+    )
+    .success();
+    let output = Command::new("jj")
+        .args(["workspace", "list"])
+        .current_dir(&root)
+        .output()
+        .unwrap();
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains("expired-ws"),
+        "workspace kept by git's expiry must not be reaped"
+    );
+
+    // Expiry reached: both sides agree it is gone.
+    run_git_shim(&root, &["worktree", "prune", "--expire", "now"], &shim_path).success();
+    let output = Command::new("jj")
+        .args(["workspace", "list"])
+        .current_dir(&root)
+        .output()
+        .unwrap();
+    assert!(
+        !String::from_utf8_lossy(&output.stdout).contains("expired-ws"),
+        "workspace pruned by git's expiry should be forgotten"
+    );
+}
+
+/// Real git never prunes locked worktree records. The reap must keep the jj
+/// workspace record for a locked workspace as well, and reap it only after
+/// the record is unlocked.
+#[test]
+fn prune_spares_locked_workspaces() {
+    require_jj_and_git();
+
+    let (_tmp, root) = setup_colocated_jj_repo();
+    let shim_dir = TempDir::new().unwrap();
+    let shim_path = shim_dir.path().canonicalize().unwrap();
+
+    run_git_shim(&root, &["worktree", "add", "locked-ws"], &shim_path).success();
+    // `lock` is not translatable, so this reaches real git.
+    run_git_shim(&root, &["worktree", "lock", "locked-ws"], &shim_path).success();
+    std::fs::remove_dir_all(root.join("locked-ws")).expect("delete ws dir");
+
+    run_git_shim(&root, &["worktree", "prune", "--expire", "now"], &shim_path).success();
+    let output = Command::new("jj")
+        .args(["workspace", "list"])
+        .current_dir(&root)
+        .output()
+        .unwrap();
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains("locked-ws"),
+        "workspace whose git record is locked must not be reaped"
+    );
+
+    run_git_shim(&root, &["worktree", "unlock", "locked-ws"], &shim_path).success();
+    run_git_shim(&root, &["worktree", "prune", "--expire", "now"], &shim_path).success();
+    let output = Command::new("jj")
+        .args(["workspace", "list"])
+        .current_dir(&root)
+        .output()
+        .unwrap();
+    assert!(
+        !String::from_utf8_lossy(&output.stdout).contains("locked-ws"),
+        "workspace whose git record was unlocked should be forgotten"
+    );
+}
+
+/// End-to-end regression for the extension's delete flow in its native
+/// colocated layout: rename the worktree aside, then
+/// `git worktree prune --expire now` — the colocated jj workspace record must
+/// be forgotten along with git's admin record.
+#[test]
+fn prune_reaps_forgotten_colocated_workspace() {
+    require_jj_and_git();
+
+    let (_tmp, root) = setup_colocated_jj_repo();
+    let shim_dir = TempDir::new().unwrap();
+    let shim_path = shim_dir.path().canonicalize().unwrap();
+
+    run_git_shim(&root, &["worktree", "add", "ext-ws"], &shim_path).success();
+    std::fs::rename(root.join("ext-ws"), root.join(".ext-aside")).expect("rename ws aside");
+
+    run_git_shim(&root, &["worktree", "prune", "--expire", "now"], &shim_path)
+        .success()
+        .stderr(predicate::str::contains("Forgotten workspace 'ext-ws'"));
+
+    let output = Command::new("jj")
+        .args(["workspace", "list"])
+        .current_dir(&root)
+        .output()
+        .unwrap();
+    assert!(
+        !String::from_utf8_lossy(&output.stdout).contains("ext-ws"),
+        "colocated workspace with removed directory should be forgotten"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // 12. jj as caller: its internal git worktree calls pass through
 // ---------------------------------------------------------------------------

@@ -101,7 +101,7 @@ fn is_jj_worktree_binary(path: &Path) -> bool {
 ///
 /// 1. If `JJ_WORKTREE_REAL_GIT` is set, use that.
 /// 2. Otherwise, search PATH for a `git` that is not a jj-worktree binary.
-fn find_real_git() -> Result<PathBuf, Box<dyn std::error::Error>> {
+pub(crate) fn find_real_git() -> Result<PathBuf, Box<dyn std::error::Error>> {
     // Check environment variable override
     if let Ok(path) = env::var("JJ_WORKTREE_REAL_GIT") {
         let p = PathBuf::from(&path);
@@ -280,9 +280,16 @@ pub fn run(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
             // admin records -- the colocated jj workspace record would then
             // linger until a manual `jj workspace forget`. Before handing the
             // call to real git, forget workspaces whose directories are already
-            // gone; jj's own internal prunes stay pure pass-through.
-            if sub == Some("prune") && !is_jj_caller {
-                crate::worktree::reap_forgotten_workspaces(&start_dir);
+            // gone -- but only where real git agrees: a dry-run must not
+            // mutate anything, and a record real git keeps (`--expire` not
+            // reached, or locked) keeps its jj workspace record too, so the
+            // two sides never disagree about which worktrees exist. jj's own
+            // internal prunes stay pure pass-through.
+            if sub == Some("prune")
+                && !is_jj_caller
+                && !crate::worktree::prune_is_dry_run(&worktree_args[1..])
+            {
+                crate::worktree::reap_forgotten_workspaces(&start_dir, &worktree_args[1..]);
             }
             if !translate || is_jj_caller {
                 return exec_real_git(args);
