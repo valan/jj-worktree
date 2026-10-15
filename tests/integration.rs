@@ -736,6 +736,101 @@ fn shim_status_maps_added_to_staged_add() {
 }
 
 // ---------------------------------------------------------------------------
+// 9. drop-in pass-through: untranslatable worktree operations reach real git
+// ---------------------------------------------------------------------------
+
+/// The shim's contract is to be a drop-in `git`: only the worktree operations
+/// it can fully honor are translated, everything else reaches real git. A
+/// colocated workspace *is* a real git worktree, so real git's answer is
+/// correct where the shim's translation would be a lossy no-op or an error.
+///
+/// Regression: `list --porcelain` (used by git clients to enumerate
+/// worktrees) used to fail with "list takes no options".
+#[test]
+fn shim_worktree_list_porcelain_passthrough() {
+    require_jj_and_git();
+
+    let (_tmp, repo_root, _main_ws) = setup_jj_repo();
+    let shim_dir = TempDir::new().unwrap();
+    let shim_path = shim_dir.path().canonicalize().unwrap();
+
+    run_git_shim(&repo_root, &["worktree", "list", "--porcelain"], &shim_path)
+        .success()
+        .stdout(predicate::str::contains("worktree "));
+}
+
+/// Regression: unhandled worktree subcommands used to die with
+/// "unknown worktree subcommand". They must reach real git instead, so the
+/// caller sees git's own error for its own mistake.
+#[test]
+fn shim_worktree_unhandled_subcommand_passthrough() {
+    require_jj_and_git();
+
+    let (_tmp, repo_root, _main_ws) = setup_jj_repo();
+    let shim_dir = TempDir::new().unwrap();
+    let shim_path = shim_dir.path().canonicalize().unwrap();
+
+    // `git worktree lock` on a path that is not a worktree: real git rejects
+    // it with its own message. The shim must not intercept it.
+    run_git_shim(
+        &repo_root,
+        &["worktree", "lock", "not-a-worktree"],
+        &shim_path,
+    )
+    .failure()
+    .stderr(predicate::str::contains("is not a working tree"))
+    .stderr(predicate::str::contains("unknown worktree subcommand").not());
+}
+
+/// `--orphan` has no jj equivalent: translating it would produce a jj
+/// workspace where the caller asked for a git-native orphan worktree. The
+/// whole call passes through to real git, so the result is a real git
+/// worktree that jj does not track as a workspace.
+#[test]
+fn shim_worktree_add_orphan_passthrough() {
+    require_jj_and_git();
+
+    let (_tmp, repo_root, _main_ws) = setup_jj_repo();
+    let shim_dir = TempDir::new().unwrap();
+    let shim_path = shim_dir.path().canonicalize().unwrap();
+
+    // The exact call shape jj itself uses for colocated workspaces.
+    run_git_shim(
+        &repo_root,
+        &[
+            "worktree",
+            "add",
+            "--orphan",
+            "-b",
+            "orphan-branch",
+            "orphan-ws",
+        ],
+        &shim_path,
+    )
+    .success();
+
+    // Real git made a git worktree (with its own .git file), not a jj workspace.
+    let ws_dir = repo_root.join("orphan-ws");
+    assert!(ws_dir.exists(), "git worktree directory should exist");
+    assert!(
+        ws_dir.join(".git").is_file(),
+        "orphan worktree should be a real git worktree (.git file), not a jj workspace"
+    );
+
+    let output = Command::new("jj")
+        .args(["workspace", "list"])
+        .current_dir(&repo_root)
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        !stdout.contains("orphan-ws"),
+        "jj must not track the git-native orphan workspace, got: {}",
+        stdout
+    );
+}
+
+// ---------------------------------------------------------------------------
 // jj as caller: its internal git worktree calls pass through (recursion guard)
 // ---------------------------------------------------------------------------
 

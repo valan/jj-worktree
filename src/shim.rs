@@ -240,15 +240,32 @@ pub fn run(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
 
     match (subcmd.as_str(), &repo_root) {
         ("worktree", Some(_root)) => {
+            // The module's contract is that the shim is a drop-in `git`: it
+            // translates the worktree operations it fully understands and
+            // passes everything else through to real git. Only `add` (a user
+            // worktree, not a detached pool slot) and `remove` need jj
+            // semantics; `list` gains no jj-specific value here because a
+            // colocated workspace *is* a real git worktree, and the plain
+            // `jj-worktree list` formatting is not porcelain and rejects git's
+            // own options. Anything else -- `prune`, `move`, `repair`, an
+            // unknown flag such as `--detach` -- falls through to real git.
             let worktree_args: Vec<String> = args[subcmd_index + 1..].to_vec();
+            let sub = worktree_args.first().map(String::as_str);
+            let has = |flag: &str| worktree_args.iter().any(|a| a == flag);
+            let translate = match sub {
+                Some("add") => !has("--detach") && !has("--orphan"),
+                Some("remove") => true,
+                Some("list") => worktree_args.iter().skip(1).all(|a| !a.starts_with('-')),
+                _ => false,
+            };
+            let is_jj_caller = crate::issue_log::caller_is_jj();
             // jj itself (colocated repos) spawns `git worktree` internally to
             // create/prune/remove the backing git worktree. If this shim is
             // ahead of real git in PATH -- which it is whenever it is installed
-            // as the `git` on PATH -- those internal calls land here and, if
-            // translated, re-enter `jj workspace add` and recurse until the
-            // operation fails. Pass jj's own calls through to real git
-            // unconditionally.
-            if crate::issue_log::caller_is_jj() {
+            // as the `git` on PATH -- those internal calls land here. Skipping
+            // the translation for jj's own calls avoids re-entering `jj
+            // workspace add` and recursing until the operation fails.
+            if !translate || is_jj_caller {
                 return exec_real_git(args);
             }
             // Redirect to jj-worktree's worktree module.
